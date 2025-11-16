@@ -33,7 +33,7 @@ class FRTParser:
     """Parser for RCMP Firearms Reference Table PDFs"""
 
     # RCMP FRT URL (update this with direct PDF link if known)
-    FRT_URL = "https://rcmp.ca/sites/default/files/dam/frt-1103.pdf"
+    FRT_URL = "https://rcmp.ca/en/firearms/firearms-reference-table"
 
     # Browser headers to avoid 403 errors
     BROWSER_HEADERS = {

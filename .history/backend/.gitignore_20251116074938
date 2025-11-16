@@ -11,4 +11,3 @@ data/*.json
 logs/*.log
 .env
 .DS_Store
-
