@@ -532,37 +532,46 @@ class FRTParser:
 
                 else:
                     # Normal processing with detected column boundaries
+                    # Use text extraction with column boundaries instead of table extraction
+                    logger.info("Using column-based text extraction")
+
                     # Process each page
                     for page_num, page in enumerate(tqdm(pdf.pages, desc="Processing pages")):
-                        # Extract tables (pdfplumber can detect table structure)
-                        tables = page.extract_tables()
+                        # Extract words to identify text rows
+                        words = page.extract_words(x_tolerance=3, y_tolerance=3, keep_blank_chars=False)
 
-                        if not tables:
-                            if page_num < 20:  # Only warn for first few pages
-                                logger.warning(f"No tables found on page {page_num + 1}")
+                        if not words:
                             continue
 
-                        # Process the first (main) table on the page
-                        table = tables[0]
+                        # Group words by y-position to identify rows
+                        # Group words that are within 3 points vertically
+                        rows_dict = {}
+                        for word in words:
+                            y_pos = round(word['top'], 0)  # Round to nearest pixel
+                            if y_pos not in rows_dict:
+                                rows_dict[y_pos] = []
+                            rows_dict[y_pos].append(word)
 
-                        for row_idx, row in enumerate(table):
-                            # Skip header rows on first page
-                            if row_idx == 0 and page_num < 2:
-                                # Check if this looks like a header row
-                                if row and any(str(cell).upper() in ['FRN', 'MAKE', 'MODEL', 'CLASS'] for cell in row if cell):
+                        # Sort rows by y position
+                        sorted_y_positions = sorted(rows_dict.keys())
+
+                        # Process each row
+                        for y_pos in sorted_y_positions:
+                            row_words = rows_dict[y_pos]
+
+                            # Skip if this looks like a header row
+                            if page_num < 5:  # Only check first few pages
+                                row_text = ' '.join([w['text'] for w in row_words]).upper()
+                                if any(header in row_text for header in ['FRN', 'MAKE', 'MODEL', 'CLASS', 'MANUFACTURER']):
                                     continue
 
-                            # Handle empty rows
-                            if not row or all(not cell for cell in row):
-                                continue
-
-                            # Map row to columns (assuming column order matches EXPECTED_COLUMNS)
+                            # Extract text from each column for this row
                             row_dict = {}
-                            for col_idx, col_name in enumerate(self.EXPECTED_COLUMNS):
-                                if col_idx < len(row):
-                                    row_dict[col_name] = str(row[col_idx]).strip() if row[col_idx] else ""
-                                else:
-                                    row_dict[col_name] = ""
+                            for col_name, (x_start, x_end) in self.column_boundaries.items():
+                                # Get words in this column
+                                col_words = [w for w in row_words if w['x0'] >= x_start - 2 and w['x0'] < x_end]
+                                col_text = ' '.join([w['text'] for w in col_words])
+                                row_dict[col_name] = col_text.strip()
 
                             # Check if this is a new record (has valid FRN) or continuation
                             frn = row_dict.get('FRN', '').strip()
@@ -593,6 +602,10 @@ class FRTParser:
                                             field_name = col_name.lower()
                                             if field_name in current_record:
                                                 current_record[field_name] += ' ' + row_dict[col_name].strip()
+
+                        # Periodic progress logging and memory management
+                        if (page_num + 1) % 1000 == 0:
+                            logger.info(f"Processed {page_num + 1} pages, {len(records)} records so far")
 
                     # Add the last record
                     if current_record:
