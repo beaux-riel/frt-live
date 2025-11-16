@@ -2,6 +2,8 @@
 
 Automated ingestion and parsing system for the RCMP Firearms Reference Table (FRT).
 
+> **⚠️ IMPORTANT**: If you get a **403 Forbidden** error when downloading the PDF, see the [Setup Guide](SETUP_GUIDE.md) for manual download instructions. The RCMP website may block automated downloads.
+
 ## Overview
 
 This backend system provides:
@@ -58,7 +60,20 @@ mkdir -p data logs
 
 ## Usage
 
-### Basic Parsing
+### Quick Start (Recommended for 403 Errors)
+
+If automatic download fails, manually download the PDF and parse it:
+
+```bash
+# 1. Manually download FRT PDF from https://rcmp.ca/en/firearms/firearms-reference-table
+# 2. Save it to backend/data/frt_current.pdf
+# 3. Run parser:
+python src/frt_parser.py --skip-download
+```
+
+**See [SETUP_GUIDE.md](SETUP_GUIDE.md) for detailed troubleshooting.**
+
+### Basic Parsing (Automatic Download)
 
 Parse the FRT PDF and generate JSON database:
 
@@ -71,6 +86,20 @@ This will:
 2. Download the PDF if new version available
 3. Parse all records
 4. Output to `data/frt_database.json`
+
+### Find PDF URL
+
+Use the helper utility to find PDF links on the RCMP page:
+
+```bash
+python find_pdf_url.py
+```
+
+Then use the URL it finds:
+
+```bash
+python src/frt_parser.py --url "https://example.com/frt.pdf"
+```
 
 ### Force Re-download
 
@@ -229,17 +258,26 @@ backend/
 
 ## Troubleshooting
 
-### "Failed to detect column boundaries"
+**📖 For detailed troubleshooting, see [SETUP_GUIDE.md](SETUP_GUIDE.md)**
+
+### Common Issues
+
+#### 403 Forbidden Error
+The RCMP website is blocking automated downloads. **Solution**: Manually download the PDF.
+
+See [SETUP_GUIDE.md](SETUP_GUIDE.md) → Method 3: Manual Download
+
+#### "Received HTML page instead of PDF"
+The URL points to a webpage, not directly to a PDF. **Solution**: Find the actual PDF download link.
+
+See [SETUP_GUIDE.md](SETUP_GUIDE.md) → Method 2: Find the PDF URL
+
+#### "Failed to detect column boundaries"
 - The PDF structure may have changed
 - Check logs for details: `logs/frt_parser.log`
 - Verify PDF has expected column headers
 
-### "Error downloading PDF"
-- Check internet connection
-- Verify FRT_PDF_URL is correct
-- RCMP website may be down or URL changed
-
-### "No tables found on page"
+#### "No tables found on page"
 - PDF may use different structure
 - Check if PDF is text-based (not scanned image)
 - May need OCR if PDF is image-based

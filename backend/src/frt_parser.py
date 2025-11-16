@@ -32,8 +32,18 @@ logger = logging.getLogger(__name__)
 class FRTParser:
     """Parser for RCMP Firearms Reference Table PDFs"""
 
-    # RCMP FRT URL (placeholder - will need actual URL)
-    FRT_URL = "https://www.rcmp-grc.gc.ca/en/firearms/firearms-reference-table"
+    # RCMP FRT URL (update this with direct PDF link if known)
+    FRT_URL = "https://rcmp.ca/en/firearms/firearms-reference-table"
+
+    # Browser headers to avoid 403 errors
+    BROWSER_HEADERS = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1'
+    }
 
     # Expected column headers in the FRT PDF
     EXPECTED_COLUMNS = ['FRN', 'Make', 'Model', 'Manufacturer', 'Type', 'Action', 'Class', 'Notes']
@@ -55,13 +65,14 @@ class FRTParser:
         '12(7)': 'Prohibited',
     }
 
-    def __init__(self, data_dir: str = 'data', output_file: str = 'frt_database.json'):
+    def __init__(self, data_dir: str = 'data', output_file: str = 'frt_database.json', pdf_url: Optional[str] = None):
         """
         Initialize the FRT Parser
 
         Args:
             data_dir: Directory to store downloaded PDFs
             output_file: Output JSON file path
+            pdf_url: Optional direct PDF URL (overrides default)
         """
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(exist_ok=True)
@@ -69,6 +80,10 @@ class FRTParser:
         self.output_file = self.data_dir / output_file
         self.pdf_path = self.data_dir / 'frt_current.pdf'
         self.metadata_path = self.data_dir / 'frt_metadata.json'
+
+        # Use custom URL if provided
+        if pdf_url:
+            self.FRT_URL = pdf_url
 
         # Column boundaries (will be detected from PDF)
         self.column_boundaries: Dict[str, Tuple[float, float]] = {}
@@ -83,9 +98,18 @@ class FRTParser:
         try:
             logger.info(f"Checking for updates at {self.FRT_URL}")
 
-            # Make HEAD request to check Last-Modified header
-            response = requests.head(self.FRT_URL, allow_redirects=True, timeout=10)
+            # Make HEAD request to check Last-Modified header with browser headers
+            response = requests.head(
+                self.FRT_URL,
+                headers=self.BROWSER_HEADERS,
+                allow_redirects=True,
+                timeout=10
+            )
             response.raise_for_status()
+
+            # Log if we were redirected
+            if response.url != self.FRT_URL:
+                logger.info(f"Redirected to: {response.url}")
 
             remote_last_modified = response.headers.get('Last-Modified')
             if not remote_last_modified:
@@ -133,8 +157,34 @@ class FRTParser:
 
             logger.info(f"Downloading FRT PDF from {self.FRT_URL}")
 
-            response = requests.get(self.FRT_URL, stream=True, timeout=30)
+            # Use browser headers to avoid 403 errors
+            response = requests.get(
+                self.FRT_URL,
+                headers=self.BROWSER_HEADERS,
+                stream=True,
+                timeout=30,
+                allow_redirects=True
+            )
             response.raise_for_status()
+
+            # Check if we got HTML instead of PDF
+            content_type = response.headers.get('content-type', '').lower()
+            if 'text/html' in content_type:
+                logger.error(
+                    f"Received HTML page instead of PDF. "
+                    f"The URL '{self.FRT_URL}' may be a web page, not a direct PDF link."
+                )
+                logger.error(
+                    "Please find the actual PDF download link and either:\n"
+                    "  1. Set FRT_PDF_URL environment variable, or\n"
+                    "  2. Pass pdf_url parameter to FRTParser, or\n"
+                    "  3. Manually download PDF to data/frt_current.pdf"
+                )
+                return False
+
+            # Log if we were redirected
+            if response.url != self.FRT_URL:
+                logger.info(f"Redirected to: {response.url}")
 
             # Get total file size for progress bar
             total_size = int(response.headers.get('content-length', 0))
@@ -147,12 +197,21 @@ class FRTParser:
                             f.write(chunk)
                             pbar.update(len(chunk))
 
+            # Verify it's actually a PDF
+            with open(self.pdf_path, 'rb') as f:
+                header = f.read(4)
+                if header != b'%PDF':
+                    logger.error("Downloaded file is not a valid PDF!")
+                    logger.error("Please check the URL or manually download the PDF to data/frt_current.pdf")
+                    return False
+
             # Save metadata
             metadata = {
                 'last_modified': response.headers.get('Last-Modified', datetime.now().isoformat()),
                 'download_date': datetime.now().isoformat(),
                 'file_size': os.path.getsize(self.pdf_path),
-                'url': self.FRT_URL
+                'url': self.FRT_URL,
+                'actual_url': response.url
             }
 
             with open(self.metadata_path, 'w') as f:
@@ -161,6 +220,16 @@ class FRTParser:
             logger.info(f"PDF downloaded successfully ({total_size / 1024 / 1024:.2f} MB)")
             return True
 
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP Error downloading PDF: {e}")
+            logger.error(
+                "\nTroubleshooting:\n"
+                "  - The URL may have changed. Check the RCMP website for the latest FRT PDF.\n"
+                "  - The website may be blocking automated requests.\n"
+                "  - You can manually download the PDF and place it in: data/frt_current.pdf\n"
+                f"  - Current URL: {self.FRT_URL}"
+            )
+            return False
         except Exception as e:
             logger.error(f"Error downloading PDF: {e}")
             return False
@@ -461,21 +530,37 @@ class FRTParser:
             logger.error(f"Error parsing PDF: {e}", exc_info=True)
             return 0
 
-    def run(self, force_download: bool = False):
+    def run(self, force_download: bool = False, skip_download: bool = False):
         """
         Run the complete FRT parsing pipeline
 
         Args:
             force_download: Force download even if cached version exists
+            skip_download: Skip download and use existing PDF file
         """
         logger.info("=" * 50)
         logger.info("FRT-Live PDF Parser Starting")
         logger.info("=" * 50)
 
-        # Step 1: Download PDF
-        if not self.download_pdf(force=force_download):
-            logger.error("Failed to download PDF")
-            return
+        # Step 1: Download PDF (unless skipped)
+        if not skip_download:
+            if not self.download_pdf(force=force_download):
+                logger.warning("Failed to download PDF")
+
+                # Check if we have a local PDF to work with
+                if self.pdf_path.exists():
+                    logger.info(f"Found existing PDF file: {self.pdf_path}")
+                    logger.info("Proceeding with local file...")
+                else:
+                    logger.error("No local PDF file available")
+                    logger.error(f"Please manually download the FRT PDF and place it at: {self.pdf_path}")
+                    return
+        else:
+            logger.info("Skipping download, using existing PDF file")
+            if not self.pdf_path.exists():
+                logger.error(f"PDF file not found: {self.pdf_path}")
+                logger.error("Please download the FRT PDF first or run without --skip-download")
+                return
 
         # Step 2: Parse PDF
         record_count = self.parse_pdf()
@@ -493,19 +578,39 @@ def main():
     """Main entry point"""
     import argparse
 
-    parser = argparse.ArgumentParser(description='Parse RCMP Firearms Reference Table PDF')
-    parser.add_argument('--force', action='store_true', help='Force download even if cached')
-    parser.add_argument('--data-dir', default='data', help='Data directory path')
-    parser.add_argument('--output', default='frt_database.json', help='Output JSON filename')
+    arg_parser = argparse.ArgumentParser(
+        description='Parse RCMP Firearms Reference Table PDF',
+        epilog="""
+Examples:
+  # Parse using existing local PDF (skip download)
+  python frt_parser.py --skip-download
 
-    args = parser.parse_args()
+  # Force download and parse
+  python frt_parser.py --force
+
+  # Use custom PDF URL
+  python frt_parser.py --url "https://example.com/frt.pdf"
+
+  # Manually place PDF and parse
+  # 1. Download PDF to backend/data/frt_current.pdf
+  # 2. Run: python frt_parser.py --skip-download
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    arg_parser.add_argument('--force', action='store_true', help='Force download even if cached')
+    arg_parser.add_argument('--skip-download', action='store_true', help='Skip download, use existing PDF file')
+    arg_parser.add_argument('--data-dir', default='data', help='Data directory path')
+    arg_parser.add_argument('--output', default='frt_database.json', help='Output JSON filename')
+    arg_parser.add_argument('--url', help='Direct PDF URL (overrides default)')
+
+    args = arg_parser.parse_args()
 
     # Create logs directory
     Path('logs').mkdir(exist_ok=True)
 
     # Run parser
-    parser = FRTParser(data_dir=args.data_dir, output_file=args.output)
-    parser.run(force_download=args.force)
+    frt_parser = FRTParser(data_dir=args.data_dir, output_file=args.output, pdf_url=args.url)
+    frt_parser.run(force_download=args.force, skip_download=args.skip_download)
 
 
 if __name__ == '__main__':

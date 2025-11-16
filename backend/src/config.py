@@ -11,14 +11,14 @@ DATA_DIR = BASE_DIR / 'data'
 LOGS_DIR = BASE_DIR / 'logs'
 
 # RCMP FRT URL
-# NOTE: This is a placeholder. The actual URL needs to be updated.
+# NOTE: This is the FRT information page. The actual PDF link is on this page.
 # The RCMP provides the FRT at their website, but the exact PDF URL may change.
-# Common locations:
-# - https://www.rcmp-grc.gc.ca/en/firearms/firearms-reference-table
-# - Direct PDF links are often provided on the page
+# Main page: https://rcmp.ca/en/firearms/firearms-reference-table
+# You need to find the direct PDF link from this page.
+# To use a direct PDF URL, set the FRT_PDF_URL environment variable.
 FRT_PDF_URL = os.getenv(
     'FRT_PDF_URL',
-    'https://www.rcmp-grc.gc.ca/en/firearms/firearms-reference-table'
+    'https://rcmp.ca/en/firearms/firearms-reference-table'
 )
 
 # File names
