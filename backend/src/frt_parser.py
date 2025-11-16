@@ -16,6 +16,9 @@ from typing import Dict, List, Optional, Tuple
 from dateutil import parser as date_parser
 from tqdm import tqdm
 
+# Import page classifier
+from page_classifier import PageClassifier
+
 
 # Configure logging
 logging.basicConfig(
@@ -87,6 +90,9 @@ class FRTParser:
 
         # Column boundaries (will be detected from PDF)
         self.column_boundaries: Dict[str, Tuple[float, float]] = {}
+
+        # Page classifier for detecting page types
+        self.page_classifier = PageClassifier()
 
     def check_for_updates(self) -> bool:
         """
@@ -384,9 +390,76 @@ class FRTParser:
         """
         if not frn:
             return False
-        # FRN is typically numeric, possibly with hyphens or letters
-        # Example formats: 123456, 12345-A, etc.
-        return bool(re.match(r'^[\d\-A-Za-z]+$', frn.strip()))
+
+        frn = frn.strip()
+
+        # FRN should be primarily numeric
+        # Valid formats: 123456, 12345-1, 12345-A, etc.
+        # Must have at least 3 digits
+        digit_count = sum(1 for c in frn if c.isdigit())
+        if digit_count < 3:
+            return False
+
+        # Check pattern: alphanumeric with optional hyphens
+        if not re.match(r'^[\d\-A-Za-z]+$', frn):
+            return False
+
+        # Should not be too long (FRNs are typically 5-7 characters)
+        if len(frn) > 15:
+            return False
+
+        # Should not start with common non-FRN words
+        non_frn_prefixes = ['page', 'frt', 'note', 'see', 'model', 'make']
+        if any(frn.lower().startswith(prefix) for prefix in non_frn_prefixes):
+            return False
+
+        return True
+
+    def is_data_row(self, row_dict: Dict[str, str]) -> bool:
+        """
+        Validate if a row contains actual firearm data (not headers/notes/sections)
+
+        Args:
+            row_dict: Dictionary with column values
+
+        Returns:
+            True if this appears to be a data row
+        """
+        # Must have valid FRN
+        frn = row_dict.get('FRN', '').strip()
+        if not self.is_valid_frn(frn):
+            return False
+
+        # Should have at least 2 of the core fields populated
+        core_fields = ['Make', 'Model', 'Class']
+        populated_count = sum(
+            1 for field in core_fields
+            if row_dict.get(field, '').strip() and len(row_dict.get(field, '').strip()) > 1
+        )
+
+        if populated_count < 2:
+            return False
+
+        # Class field should not be a common word from notes
+        class_value = row_dict.get('Class', '').strip()
+        if class_value:
+            # Check if it looks like a classification
+            class_upper = class_value.upper()
+            is_valid_class = any(
+                key in class_upper for key in self.STANDARD_CLASSES.keys()
+            )
+
+            # If class doesn't match any standard format and is a common word, reject
+            if not is_valid_class and len(class_value.split()) == 1:
+                # Single words that are clearly not classifications
+                common_words = {
+                    'THE', 'AND', 'OR', 'WITH', 'FOR', 'FROM', 'THAT', 'THIS',
+                    'HAVE', 'BEEN', 'WERE', 'THEIR', 'ABOVE', 'BELOW', 'BETWEEN'
+                }
+                if class_upper in common_words:
+                    return False
+
+        return True
 
     def sanitize_class(self, class_value: str) -> str:
         """
@@ -409,14 +482,33 @@ class FRTParser:
             if key in clean:
                 return standard
 
-        # Only warn if this looks like it was meant to be a classification
-        # (short text, contains typical classification indicators)
-        if len(clean) <= 20 and any(indicator in clean for indicator in ['R', 'P', 'N', '12(', 'RESTRICT', 'PROHIBIT']):
+        # Only warn if this genuinely looks like a classification attempt
+        # Don't warn on obvious misclassified notes text
+        should_warn = (
+            len(clean) <= 20 and
+            len(clean.split()) <= 2 and  # Max 2 words
+            any(indicator in clean for indicator in ['R', 'P', 'N', '12(', 'RESTRICT', 'PROHIBIT']) and
+            # Exclude common words that got misclassified
+            clean not in {'AND', 'OR', 'THE', 'WITH', 'FOR', 'FROM', 'ABOVE', 'BELOW',
+                         'MOUNTED', 'SYNTHETIC', 'ACTION', 'SOUND', 'MAGAZINE', 'VENTILATED',
+                         'DIMENSIONS', 'SHOTGUNS', 'NICKELED', 'BLADE', 'STOCK', 'BULLET',
+                         'CHEEK', 'WINDAGE', 'WOODEN', 'CUSTOM', 'THAT', 'THIS', 'BEEN'}
+        )
+
+        if should_warn:
             logger.warning(f"Unknown classification value: {class_value}")
 
         # Return original if no match, or "Unknown" if it's clearly not a classification
         if len(clean) > 20 or len(clean.split()) > 3:
             return "Unknown"
+
+        # If it's a single common word, return Unknown
+        if clean in {'AND', 'OR', 'THE', 'WITH', 'FOR', 'FROM', 'ABOVE', 'BELOW',
+                     'MOUNTED', 'SYNTHETIC', 'ACTION', 'SOUND', 'MAGAZINE', 'VENTILATED',
+                     'DIMENSIONS', 'SHOTGUNS', 'NICKELED', 'BLADE', 'STOCK', 'BULLET',
+                     'CHEEK', 'WINDAGE', 'WOODEN', 'CUSTOM', 'THAT', 'THIS', 'BEEN'}:
+            return "Unknown"
+
         return class_value.strip()
 
     def extract_oic_references(self, notes: str) -> List[str]:
@@ -541,8 +633,40 @@ class FRTParser:
                     # Use text extraction with column boundaries instead of table extraction
                     logger.info("Using column-based text extraction")
 
+                    # First pass: Classify pages (sample first 100 pages for efficiency)
+                    logger.info("Classifying page types...")
+                    page_types = {}
+                    sample_size = min(100, len(pdf.pages))
+                    for i in range(sample_size):
+                        page_type = self.page_classifier.classify(pdf.pages[i])
+                        page_types[i + 1] = page_type
+
+                    # Log page type statistics
+                    from collections import Counter
+                    type_counts = Counter(page_types.values())
+                    logger.info(f"Page classification (first {sample_size} pages): {dict(type_counts)}")
+
+                    # For remaining pages, assume TABLE unless proven otherwise
+                    for i in range(sample_size, len(pdf.pages)):
+                        page_types[i + 1] = 'TABLE'  # Default assumption
+
+                    # Track statistics
+                    skipped_pages = 0
+                    processed_pages = 0
+
                     # Process each page
                     for page_num, page in enumerate(tqdm(pdf.pages, desc="Processing pages")):
+                        # Check page type
+                        page_type = page_types.get(page_num + 1, 'TABLE')
+
+                        # Skip non-table pages (REPORT, COVER pages don't contain tabular data)
+                        if page_type in ['REPORT', 'COVER']:
+                            skipped_pages += 1
+                            logger.debug(f"Skipping page {page_num + 1} (type: {page_type})")
+                            continue
+
+                        processed_pages += 1
+
                         # Extract words to identify text rows
                         words = page.extract_words(x_tolerance=3, y_tolerance=3, keep_blank_chars=False)
 
@@ -587,7 +711,8 @@ class FRTParser:
                             # Check if this is a new record (has valid FRN) or continuation
                             frn = row_dict.get('FRN', '').strip()
 
-                            if self.is_valid_frn(frn):
+                            # Use enhanced validation to check if this is a data row
+                            if self.is_valid_frn(frn) and self.is_data_row(row_dict):
                                 # Save previous record if exists
                                 if current_record:
                                     records.append(current_record)
@@ -621,6 +746,9 @@ class FRTParser:
                     # Add the last record
                     if current_record:
                         records.append(current_record)
+
+                    # Log page processing statistics
+                    logger.info(f"Page processing complete: {processed_pages} table pages processed, {skipped_pages} pages skipped")
 
             # Post-process: Extract OIC references
             logger.info("Extracting OIC references from notes")
