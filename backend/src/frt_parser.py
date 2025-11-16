@@ -409,8 +409,14 @@ class FRTParser:
             if key in clean:
                 return standard
 
-        # Return original if no match
-        logger.warning(f"Unknown classification value: {class_value}")
+        # Only warn if this looks like it was meant to be a classification
+        # (short text, contains typical classification indicators)
+        if len(clean) <= 20 and any(indicator in clean for indicator in ['R', 'P', 'N', '12(', 'RESTRICT', 'PROHIBIT']):
+            logger.warning(f"Unknown classification value: {class_value}")
+
+        # Return original if no match, or "Unknown" if it's clearly not a classification
+        if len(clean) > 20 or len(clean.split()) > 3:
+            return "Unknown"
         return class_value.strip()
 
     def extract_oic_references(self, notes: str) -> List[str]:
@@ -568,8 +574,13 @@ class FRTParser:
                             # Extract text from each column for this row
                             row_dict = {}
                             for col_name, (x_start, x_end) in self.column_boundaries.items():
-                                # Get words in this column
-                                col_words = [w for w in row_words if w['x0'] >= x_start - 2 and w['x0'] < x_end]
+                                # Get words in this column - check if word's center is within column bounds
+                                col_words = []
+                                for w in row_words:
+                                    word_center = (w['x0'] + w['x1']) / 2
+                                    # Word belongs to this column if its center is within the boundaries
+                                    if x_start <= word_center < x_end:
+                                        col_words.append(w)
                                 col_text = ' '.join([w['text'] for w in col_words])
                                 row_dict[col_name] = col_text.strip()
 
