@@ -236,7 +236,8 @@ class FRTParser:
 
     def detect_column_boundaries(self, pdf: pdfplumber.PDF) -> bool:
         """
-        Detect column boundaries from the first page header
+        Detect column boundaries from the PDF header
+        Tries multiple pages if the first page doesn't contain headers
 
         Args:
             pdf: pdfplumber PDF object
@@ -247,55 +248,89 @@ class FRTParser:
         try:
             logger.info("Detecting column boundaries from PDF header")
 
-            # Get the first page
-            first_page = pdf.pages[0]
+            # Try first few pages to find headers (some PDFs have cover pages)
+            max_pages_to_check = min(10, len(pdf.pages))
 
-            # Extract words with their positions
-            words = first_page.extract_words(x_tolerance=3, y_tolerance=3)
+            for page_idx in range(max_pages_to_check):
+                page = pdf.pages[page_idx]
 
-            # Find header row by looking for expected column names
-            header_words = []
-            for word in words:
-                if word['text'].upper() in [col.upper() for col in self.EXPECTED_COLUMNS]:
-                    header_words.append(word)
+                # Extract words with their positions
+                words = page.extract_words(x_tolerance=3, y_tolerance=3)
 
-            if len(header_words) < len(self.EXPECTED_COLUMNS) - 1:
-                logger.warning(f"Only found {len(header_words)} column headers, expected {len(self.EXPECTED_COLUMNS)}")
+                if not words:
+                    logger.warning(f"Page {page_idx + 1}: No text found, trying next page")
+                    continue
 
-            # Sort by x position
-            header_words.sort(key=lambda w: w['x0'])
+                # Find header row by looking for expected column names
+                # Use fuzzy matching - look for partial matches
+                header_words = []
+                for word in words:
+                    word_upper = word['text'].upper().strip()
+                    # Check for exact and partial matches
+                    for expected_col in self.EXPECTED_COLUMNS:
+                        expected_upper = expected_col.upper()
+                        # Match if the word contains the column name or vice versa
+                        # Also handle common variations like "MAKE/MODEL" split across words
+                        if (expected_upper in word_upper or
+                            word_upper in expected_upper or
+                            word_upper == expected_upper.replace(' ', '') or
+                            expected_upper.replace(' ', '') in word_upper):
+                            # Avoid duplicates
+                            if not any(hw['text'].upper() == word_upper for hw in header_words):
+                                header_words.append(word)
+                                break
 
-            # Create column boundaries
-            page_width = first_page.width
+                logger.info(f"Page {page_idx + 1}: Found {len(header_words)} potential column headers")
 
-            for i, word in enumerate(header_words):
-                col_name = None
-                # Match to expected columns
-                for expected in self.EXPECTED_COLUMNS:
-                    if expected.upper() in word['text'].upper() or word['text'].upper() in expected.upper():
-                        col_name = expected
-                        break
+                # If we found enough headers, use this page
+                if len(header_words) >= 4:  # At least need FRN, Make, Model, Class
+                    logger.info(f"Using page {page_idx + 1} for column detection")
 
-                if col_name:
-                    x_start = word['x0']
-                    # x_end is the start of the next column or page width
-                    x_end = header_words[i + 1]['x0'] if i + 1 < len(header_words) else page_width
-                    self.column_boundaries[col_name] = (x_start, x_end)
+                    # Sort by x position
+                    header_words.sort(key=lambda w: w['x0'])
 
-            logger.info(f"Detected {len(self.column_boundaries)} columns: {list(self.column_boundaries.keys())}")
+                    # Create column boundaries
+                    page_width = page.width
 
-            # Ensure we have at least FRN, Make, Model, and Class
-            required = ['FRN', 'Make', 'Model', 'Class']
-            missing = [col for col in required if col not in self.column_boundaries]
+                    for i, word in enumerate(header_words):
+                        col_name = None
+                        word_upper = word['text'].upper().strip()
 
-            if missing:
-                logger.error(f"Missing required columns: {missing}")
-                return False
+                        # Match to expected columns
+                        for expected in self.EXPECTED_COLUMNS:
+                            expected_upper = expected.upper()
+                            if (expected_upper in word_upper or
+                                word_upper in expected_upper or
+                                word_upper == expected_upper.replace(' ', '')):
+                                col_name = expected
+                                break
 
-            return True
+                        if col_name:
+                            x_start = word['x0']
+                            # x_end is the start of the next column or page width
+                            x_end = header_words[i + 1]['x0'] if i + 1 < len(header_words) else page_width
+                            self.column_boundaries[col_name] = (x_start, x_end)
+
+                    logger.info(f"Detected {len(self.column_boundaries)} columns: {list(self.column_boundaries.keys())}")
+
+                    # Ensure we have at least FRN, Make, Model, and Class
+                    required = ['FRN', 'Make', 'Model', 'Class']
+                    missing = [col for col in required if col not in self.column_boundaries]
+
+                    if not missing:
+                        return True
+                    else:
+                        logger.warning(f"Page {page_idx + 1}: Missing required columns: {missing}, trying next page")
+                        # Clear boundaries and try next page
+                        self.column_boundaries = {}
+
+            # If we get here, we didn't find headers on any page
+            logger.error(f"Failed to find column headers in first {max_pages_to_check} pages")
+            logger.error("Missing required columns: ['FRN', 'Make', 'Model', 'Class']")
+            return False
 
         except Exception as e:
-            logger.error(f"Error detecting column boundaries: {e}")
+            logger.error(f"Error detecting column boundaries: {e}", exc_info=True)
             return False
 
     def extract_text_in_bbox(self, page, bbox: Tuple[float, float, float, float]) -> str:
@@ -420,70 +455,148 @@ class FRTParser:
                 # Detect column boundaries
                 if not self.detect_column_boundaries(pdf):
                     logger.error("Failed to detect column boundaries")
-                    return 0
+                    logger.info("Attempting to parse using table extraction without column boundaries...")
 
-                # Process each page
-                for page_num, page in enumerate(tqdm(pdf.pages, desc="Processing pages")):
-                    # Extract tables (pdfplumber can detect table structure)
-                    tables = page.extract_tables()
+                    # Try parsing without column boundaries using table auto-detection
+                    # This is a fallback method
+                    for page_num, page in enumerate(tqdm(pdf.pages, desc="Processing pages (fallback mode)")):
+                        tables = page.extract_tables()
 
-                    if not tables:
-                        logger.warning(f"No tables found on page {page_num + 1}")
-                        continue
-
-                    # Process the first (main) table on the page
-                    table = tables[0]
-
-                    for row_idx, row in enumerate(table):
-                        # Skip header rows
-                        if row_idx == 0 and page_num == 0:
+                        if not tables:
                             continue
 
-                        # Handle empty rows
-                        if not row or all(not cell for cell in row):
+                        for table in tables:
+                            # First row might be headers
+                            if not table or len(table) < 2:
+                                continue
+
+                            # Try to identify columns from first row
+                            header_row = table[0]
+                            if header_row:
+                                # Map columns dynamically
+                                col_mapping = {}
+                                for idx, cell in enumerate(header_row):
+                                    if cell:
+                                        cell_upper = str(cell).upper().strip()
+                                        for expected in self.EXPECTED_COLUMNS:
+                                            if expected.upper() in cell_upper or cell_upper in expected.upper():
+                                                col_mapping[idx] = expected
+                                                break
+
+                                # Process data rows
+                                for row in table[1:]:
+                                    if not row or all(not cell for cell in row):
+                                        continue
+
+                                    # Extract FRN to check if it's a new record
+                                    frn_idx = next((idx for idx, col in col_mapping.items() if col == 'FRN'), None)
+                                    if frn_idx is None or frn_idx >= len(row):
+                                        continue
+
+                                    frn = str(row[frn_idx]).strip() if row[frn_idx] else ""
+
+                                    if self.is_valid_frn(frn):
+                                        if current_record:
+                                            records.append(current_record)
+
+                                        current_record = {
+                                            'frn': frn,
+                                            'make': '',
+                                            'model': '',
+                                            'manufacturer': '',
+                                            'type': '',
+                                            'action': '',
+                                            'class': 'Unknown',
+                                            'notes': '',
+                                            'oic_references': []
+                                        }
+
+                                        # Fill in other fields from column mapping
+                                        for idx, col_name in col_mapping.items():
+                                            if idx < len(row) and row[idx]:
+                                                field_name = col_name.lower()
+                                                value = str(row[idx]).strip()
+                                                if col_name == 'Class':
+                                                    current_record[field_name] = self.sanitize_class(value)
+                                                else:
+                                                    current_record[field_name] = value
+
+                    if current_record:
+                        records.append(current_record)
+
+                    if not records:
+                        logger.error("No records extracted using fallback method")
+                        return 0
+
+                    logger.info(f"Extracted {len(records)} records using fallback table extraction")
+
+                else:
+                    # Normal processing with detected column boundaries
+                    # Process each page
+                    for page_num, page in enumerate(tqdm(pdf.pages, desc="Processing pages")):
+                        # Extract tables (pdfplumber can detect table structure)
+                        tables = page.extract_tables()
+
+                        if not tables:
+                            if page_num < 20:  # Only warn for first few pages
+                                logger.warning(f"No tables found on page {page_num + 1}")
                             continue
 
-                        # Map row to columns (assuming column order matches EXPECTED_COLUMNS)
-                        row_dict = {}
-                        for col_idx, col_name in enumerate(self.EXPECTED_COLUMNS):
-                            if col_idx < len(row):
-                                row_dict[col_name] = row[col_idx] if row[col_idx] else ""
+                        # Process the first (main) table on the page
+                        table = tables[0]
+
+                        for row_idx, row in enumerate(table):
+                            # Skip header rows on first page
+                            if row_idx == 0 and page_num < 2:
+                                # Check if this looks like a header row
+                                if row and any(str(cell).upper() in ['FRN', 'MAKE', 'MODEL', 'CLASS'] for cell in row if cell):
+                                    continue
+
+                            # Handle empty rows
+                            if not row or all(not cell for cell in row):
+                                continue
+
+                            # Map row to columns (assuming column order matches EXPECTED_COLUMNS)
+                            row_dict = {}
+                            for col_idx, col_name in enumerate(self.EXPECTED_COLUMNS):
+                                if col_idx < len(row):
+                                    row_dict[col_name] = str(row[col_idx]).strip() if row[col_idx] else ""
+                                else:
+                                    row_dict[col_name] = ""
+
+                            # Check if this is a new record (has valid FRN) or continuation
+                            frn = row_dict.get('FRN', '').strip()
+
+                            if self.is_valid_frn(frn):
+                                # Save previous record if exists
+                                if current_record:
+                                    records.append(current_record)
+
+                                # Start new record
+                                current_record = {
+                                    'frn': frn,
+                                    'make': row_dict.get('Make', '').strip(),
+                                    'model': row_dict.get('Model', '').strip(),
+                                    'manufacturer': row_dict.get('Manufacturer', '').strip(),
+                                    'type': row_dict.get('Type', '').strip(),
+                                    'action': row_dict.get('Action', '').strip(),
+                                    'class': self.sanitize_class(row_dict.get('Class', '')),
+                                    'notes': row_dict.get('Notes', '').strip(),
+                                    'oic_references': []
+                                }
                             else:
-                                row_dict[col_name] = ""
+                                # This is a continuation row - append to current record
+                                if current_record:
+                                    # Append text to existing fields (usually Notes)
+                                    for col_name in self.EXPECTED_COLUMNS:
+                                        if col_name != 'FRN' and row_dict.get(col_name, '').strip():
+                                            field_name = col_name.lower()
+                                            if field_name in current_record:
+                                                current_record[field_name] += ' ' + row_dict[col_name].strip()
 
-                        # Check if this is a new record (has valid FRN) or continuation
-                        frn = row_dict.get('FRN', '').strip()
-
-                        if self.is_valid_frn(frn):
-                            # Save previous record if exists
-                            if current_record:
-                                records.append(current_record)
-
-                            # Start new record
-                            current_record = {
-                                'frn': frn,
-                                'make': row_dict.get('Make', '').strip(),
-                                'model': row_dict.get('Model', '').strip(),
-                                'manufacturer': row_dict.get('Manufacturer', '').strip(),
-                                'type': row_dict.get('Type', '').strip(),
-                                'action': row_dict.get('Action', '').strip(),
-                                'class': self.sanitize_class(row_dict.get('Class', '')),
-                                'notes': row_dict.get('Notes', '').strip(),
-                                'oic_references': []
-                            }
-                        else:
-                            # This is a continuation row - append to current record
-                            if current_record:
-                                # Append text to existing fields (usually Notes)
-                                for col_name in self.EXPECTED_COLUMNS:
-                                    if col_name != 'FRN' and row_dict.get(col_name, '').strip():
-                                        field_name = col_name.lower()
-                                        if field_name in current_record:
-                                            current_record[field_name] += ' ' + row_dict[col_name].strip()
-
-                # Add the last record
-                if current_record:
-                    records.append(current_record)
+                    # Add the last record
+                    if current_record:
+                        records.append(current_record)
 
             # Post-process: Extract OIC references
             logger.info("Extracting OIC references from notes")
