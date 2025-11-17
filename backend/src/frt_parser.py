@@ -10,6 +10,7 @@ import json
 import os
 import re
 import logging
+import gc
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -552,7 +553,24 @@ class FRTParser:
             current_record = None
 
             with pdfplumber.open(self.pdf_path) as pdf:
-                logger.info(f"PDF has {len(pdf.pages)} pages")
+                # Get page count safely
+                # pdfplumber.pdf.metadata contains page count without loading all pages
+                try:
+                    # Access metadata to get page count
+                    page_count = len(pdf.pages)
+
+                    # Validate page count (FRT PDFs are typically 200-500 pages)
+                    if page_count > 10000:
+                        logger.error(f"PDF reports {page_count} pages - this seems incorrect!")
+                        logger.error("This likely indicates a corrupted or malformed PDF file.")
+                        logger.error("Expected page count: 200-500 pages for FRT")
+                        logger.error("Please verify the PDF file integrity or try re-downloading it.")
+                        return 0
+
+                    logger.info(f"PDF has {page_count} pages")
+                except Exception as e:
+                    logger.error(f"Error reading PDF page count: {e}")
+                    return 0
 
                 # Detect column boundaries
                 if not self.detect_column_boundaries(pdf):
@@ -561,10 +579,12 @@ class FRTParser:
 
                     # Try parsing without column boundaries using table auto-detection
                     # This is a fallback method
-                    for page_num, page in enumerate(tqdm(pdf.pages, desc="Processing pages (fallback mode)")):
+                    for page_num in tqdm(range(page_count), desc="Processing pages (fallback mode)"):
+                        page = pdf.pages[page_num]
                         tables = page.extract_tables()
 
                         if not tables:
+                            logger.warning(f"No tables found on page {page_num + 1}")
                             continue
 
                         for table in tables:
@@ -623,6 +643,12 @@ class FRTParser:
                                                 else:
                                                     current_record[field_name] = value
 
+                        # Periodic garbage collection in fallback mode
+                        if (page_num + 1) % 100 == 0:
+                            logger.info(f"Processed {page_num + 1} pages (fallback mode), {len(records)} records so far")
+                            page.flush_cache()
+                            gc.collect()
+
                     if current_record:
                         records.append(current_record)
 
@@ -640,7 +666,7 @@ class FRTParser:
                     # First pass: Classify pages (sample first 100 pages for efficiency)
                     logger.info("Classifying page types...")
                     page_types = {}
-                    sample_size = min(100, len(pdf.pages))
+                    sample_size = min(100, page_count)
                     for i in range(sample_size):
                         page_type = self.page_classifier.classify(pdf.pages[i])
                         page_types[i + 1] = page_type
@@ -651,7 +677,7 @@ class FRTParser:
                     logger.info(f"Page classification (first {sample_size} pages): {dict(type_counts)}")
 
                     # For remaining pages, assume TABLE unless proven otherwise
-                    for i in range(sample_size, len(pdf.pages)):
+                    for i in range(sample_size, page_count):
                         page_types[i + 1] = 'TABLE'  # Default assumption
 
                     # Track statistics
@@ -664,8 +690,9 @@ class FRTParser:
                     current_report_frn = None
                     report_pages_buffer = []
 
-                    # Process each page
-                    for page_num, page in enumerate(tqdm(pdf.pages, desc="Processing pages")):
+                    # Process each page using index-based access to avoid loading all pages
+                    for page_num in tqdm(range(page_count), desc="Processing pages"):
+                        page = pdf.pages[page_num]
                         # Check page type
                         page_type = page_types.get(page_num + 1, 'TABLE')
 
@@ -793,6 +820,13 @@ class FRTParser:
                         # Periodic progress logging and memory management
                         if (page_num + 1) % 1000 == 0:
                             logger.info(f"Processed {page_num + 1} pages, {len(records)} records so far")
+                            # Explicitly flush page cache and run garbage collection
+                            page.flush_cache()
+                            gc.collect()
+
+                        # More frequent garbage collection for every 100 pages
+                        if (page_num + 1) % 100 == 0:
+                            gc.collect()
 
                     # Add the last record
                     if current_record:
