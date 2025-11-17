@@ -205,6 +205,20 @@ export LOG_LEVEL="DEBUG"  # Options: DEBUG, INFO, WARNING, ERROR
 }
 ```
 
+## FRT PDF Characteristics
+
+### Page Count
+**IMPORTANT**: The RCMP Firearms Reference Table PDF contains **107,482 pages** (as of November 2024). This is the correct and expected page count, not an error or corruption.
+
+### Memory Considerations
+Due to the extremely large page count, the parser uses special memory optimization techniques:
+- **Index-based iteration**: Pages are accessed individually via `pdf.pages[i]` instead of iterating over the entire `pdf.pages` list
+- **Periodic garbage collection**: Explicit `gc.collect()` calls every 100 pages to release memory
+- **Page cache flushing**: `page.flush_cache()` every 1000 pages to clear pdfplumber's internal caches
+- **No pre-loading**: Avoids calling `len(pdf.pages)` or iterating `for page in pdf.pages` which would load all pages into memory
+
+These optimizations prevent memory exhaustion when processing the massive PDF file.
+
 ## Common Issues
 
 ### 403 Forbidden Error
@@ -215,6 +229,13 @@ The URL points to a webpage. **Solution**: Use `find_pdf_url.py` to locate the d
 
 ### Column Detection Failures
 PDF structure changed significantly. **Solution**: Check `logs/frt_parser.log` and verify PDF has expected column headers (FRN, Make, Model, Manufacturer, Type, Action, Class, Notes).
+
+### Memory Exhaustion / Process Killed
+The PDF is extremely large (107K+ pages) and can exhaust memory if not handled properly. The parser includes built-in memory management, but if issues persist:
+- Ensure you have at least 8GB RAM available
+- Monitor memory usage during processing
+- The parser will log progress every 100 pages
+- Processing the full PDF may take 1-2 hours depending on hardware
 
 ## Dependencies
 

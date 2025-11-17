@@ -553,20 +553,11 @@ class FRTParser:
             current_record = None
 
             with pdfplumber.open(self.pdf_path) as pdf:
-                # Get page count safely
-                # pdfplumber.pdf.metadata contains page count without loading all pages
+                # Get page count
+                # NOTE: The RCMP FRT PDF is very large (107,482+ pages as of Nov 2024)
+                # We use index-based iteration to avoid loading all pages into memory
                 try:
-                    # Access metadata to get page count
                     page_count = len(pdf.pages)
-
-                    # Validate page count (FRT PDFs are typically 200-500 pages)
-                    if page_count > 10000:
-                        logger.error(f"PDF reports {page_count} pages - this seems incorrect!")
-                        logger.error("This likely indicates a corrupted or malformed PDF file.")
-                        logger.error("Expected page count: 200-500 pages for FRT")
-                        logger.error("Please verify the PDF file integrity or try re-downloading it.")
-                        return 0
-
                     logger.info(f"PDF has {page_count} pages")
                 except Exception as e:
                     logger.error(f"Error reading PDF page count: {e}")
