@@ -16,8 +16,9 @@ from typing import Dict, List, Optional, Tuple
 from dateutil import parser as date_parser
 from tqdm import tqdm
 
-# Import page classifier
+# Import page classifier and report parser
 from page_classifier import PageClassifier
+from frt_report_parser import FRTReportParser
 
 
 # Configure logging
@@ -93,6 +94,9 @@ class FRTParser:
 
         # Page classifier for detecting page types
         self.page_classifier = PageClassifier()
+
+        # Report parser for extracting data from individual report pages
+        self.report_parser = FRTReportParser()
 
     def check_for_updates(self) -> bool:
         """
@@ -652,20 +656,67 @@ class FRTParser:
 
                     # Track statistics
                     skipped_pages = 0
-                    processed_pages = 0
+                    table_pages = 0
+                    report_pages = 0
+                    cover_pages = 0
+
+                    # Track multi-page reports
+                    current_report_frn = None
+                    report_pages_buffer = []
 
                     # Process each page
                     for page_num, page in enumerate(tqdm(pdf.pages, desc="Processing pages")):
                         # Check page type
                         page_type = page_types.get(page_num + 1, 'TABLE')
 
-                        # Skip non-table pages (REPORT, COVER pages don't contain tabular data)
-                        if page_type in ['REPORT', 'COVER']:
-                            skipped_pages += 1
-                            logger.debug(f"Skipping page {page_num + 1} (type: {page_type})")
+                        # Handle REPORT pages
+                        if page_type == 'REPORT':
+                            report_pages += 1
+
+                            # Try to find FRN on this page
+                            page_frn = self.report_parser._find_frn_in_page(page)
+
+                            if page_frn:
+                                # Check if this is a continuation of current report
+                                if current_report_frn == page_frn:
+                                    # Continuation page - add to buffer
+                                    report_pages_buffer.append(page)
+                                    logger.debug(f"Added continuation page {page_num + 1} for FRN {page_frn}")
+                                else:
+                                    # New report FRN detected
+                                    # First, save previous buffered report if exists
+                                    if report_pages_buffer and current_report_frn:
+                                        logger.info(f"Processing {len(report_pages_buffer)}-page report for FRN {current_report_frn}")
+                                        multi_report = self.report_parser.parse_multi_page_report(report_pages_buffer)
+                                        if multi_report:
+                                            records.append(multi_report)
+                                        else:
+                                            logger.warning(f"Failed to parse multi-page report for FRN {current_report_frn}")
+
+                                    # Start new report buffer
+                                    current_report_frn = page_frn
+                                    report_pages_buffer = [page]
+                                    logger.debug(f"Started new report buffer for FRN {page_frn} at page {page_num + 1}")
+                            else:
+                                # No FRN found - might be a continuation page
+                                # Check if we have an active buffer
+                                if current_report_frn and report_pages_buffer:
+                                    # Assume it's a continuation
+                                    report_pages_buffer.append(page)
+                                    logger.debug(f"Added possible continuation page {page_num + 1} (no FRN) to FRN {current_report_frn}")
+                                else:
+                                    logger.warning(f"REPORT page {page_num + 1} has no FRN and no active buffer")
+
                             continue
 
-                        processed_pages += 1
+                        # Skip cover pages
+                        if page_type == 'COVER':
+                            cover_pages += 1
+                            logger.debug(f"Skipping page {page_num + 1} (type: COVER)")
+                            continue
+
+                        # Handle TABLE pages
+                        table_pages += 1
 
                         # Extract words to identify text rows
                         words = page.extract_words(x_tolerance=3, y_tolerance=3, keep_blank_chars=False)
@@ -747,8 +798,18 @@ class FRTParser:
                     if current_record:
                         records.append(current_record)
 
+                    # Add last multi-page report if exists
+                    if report_pages_buffer:
+                        multi_report = self.report_parser.parse_multi_page_report(report_pages_buffer)
+                        if multi_report:
+                            records.append(multi_report)
+
                     # Log page processing statistics
-                    logger.info(f"Page processing complete: {processed_pages} table pages processed, {skipped_pages} pages skipped")
+                    logger.info(f"Page processing complete:")
+                    logger.info(f"  - TABLE pages: {table_pages}")
+                    logger.info(f"  - REPORT pages: {report_pages}")
+                    logger.info(f"  - COVER pages: {cover_pages}")
+                    logger.info(f"  - Total records extracted: {len(records)}")
 
             # Post-process: Extract OIC references
             logger.info("Extracting OIC references from notes")

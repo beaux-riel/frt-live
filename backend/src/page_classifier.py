@@ -3,6 +3,7 @@ Page Classification Module for FRT PDF Parser
 Detects and classifies different page layouts in the FRT PDF
 """
 
+import re
 import logging
 from typing import Dict, List, Tuple
 from collections import Counter
@@ -178,6 +179,44 @@ class PageClassifier:
 
         return len(peaks)
 
+    def _is_continuation_report(self, metrics: Dict) -> bool:
+        """
+        Detect report continuation pages (pages 2+ of a multi-page report)
+
+        Args:
+            metrics: Page metrics dictionary
+
+        Returns:
+            True if this appears to be a continuation page
+        """
+        all_text = metrics.get('all_text', '')
+
+        # Has section headers but missing primary report header
+        has_continuation_headers = any(
+            header in all_text.upper()
+            for header in ['MAKE', 'MODEL', 'MANUFACTURER', 'ACTION',
+                          'SERIAL NUMBER', 'CALIBRE', 'SHOTS',
+                          'ALSO KNOWN AS', 'PRODUCT CODE']
+        )
+
+        missing_report_header = 'FRT Report' not in all_text
+
+        # Has FRN reference but not in header format
+        has_frn_reference = bool(re.search(r'\bFRN[:\s]*\d{6}', all_text))
+
+        # Continuation pages have narrative text (not columnar)
+        has_narrative_text = metrics['text_density'] > 0.3 and metrics['num_columns'] < 3
+
+        # If has section headers + narrative text + (FRN or missing header), likely continuation
+        if has_continuation_headers and has_narrative_text:
+            return True
+
+        # Strong signal: has FRN + section headers + no "FRT Report" header
+        if has_frn_reference and has_continuation_headers and missing_report_header:
+            return True
+
+        return False
+
     def _is_report_page(self, metrics: Dict) -> bool:
         """
         Determine if page is a detailed report page
@@ -190,6 +229,10 @@ class PageClassifier:
         """
         # Strong indicators
         if metrics['has_report_keywords']:
+            return True
+
+        # Check if this is a continuation page
+        if self._is_continuation_report(metrics):
             return True
 
         # Multiple section headers is a strong indicator

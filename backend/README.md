@@ -23,7 +23,9 @@ This backend system provides:
 ### Advanced Table Extraction
 - Automatically detects column boundaries from PDF structure
 - Handles multi-line rows that span across pages
-- Extracts FRN, Make, Model, Manufacturer, Type, Action, Class, and Notes
+- **NEW**: Supports multipage firearm records (detailed report pages spanning 2-3+ pages)
+- Intelligent page classification (TABLE, REPORT, COVER page types)
+- Extracts FRN, Make, Model, Manufacturer, Type, Action, Class, Notes, Product Codes, and more
 
 ### Data Sanitization
 - Standardizes classification values (Non-Restricted, Restricted, Prohibited)
@@ -180,7 +182,10 @@ export LOG_LEVEL="DEBUG"  # Options: DEBUG, INFO, WARNING, ERROR
     "action": "Pump",
     "class": "Non-Restricted",
     "notes": "Standard hunting configuration",
-    "oic_references": []
+    "oic_references": [],
+    "product_codes": [],
+    "cross_references": "No Data",
+    "multipage": false
   },
   {
     "frn": "789012",
@@ -190,11 +195,25 @@ export LOG_LEVEL="DEBUG"  # Options: DEBUG, INFO, WARNING, ERROR
     "type": "Rifle",
     "action": "Semi-Auto",
     "class": "Prohibited",
-    "notes": "Affected by OIC 2020-0001",
-    "oic_references": ["OIC 2020-0001"]
+    "notes": "Detailed specifications extracted from multiple report pages...",
+    "oic_references": ["OIC 2020-0001"],
+    "product_codes": ["AR15-A", "AR15-B", "M16-COPY"],
+    "cross_references": "See FRN 123457",
+    "calibre_variants": [
+      {"frn": "789012-1", "calibre": "5.56 NATO", "shots": "30"}
+    ],
+    "multipage": true,
+    "page_count": 3
   }
 ]
 ```
+
+**New Fields (v2.0):**
+- `product_codes`: Array of "Also Known As" product codes/names
+- `cross_references`: Related FRN references
+- `calibre_variants`: Detailed calibre/barrel length variants
+- `multipage`: Boolean indicating if extracted from multiple pages
+- `page_count`: Number of pages the record spanned (if multipage)
 
 ### Changes JSON
 
@@ -230,20 +249,79 @@ export LOG_LEVEL="DEBUG"  # Options: DEBUG, INFO, WARNING, ERROR
 ```
 backend/
 ├── src/
-│   ├── frt_parser.py       # Main PDF parser
-│   ├── diff_detector.py    # Change detection
-│   ├── config.py           # Configuration
+│   ├── frt_parser.py          # Main PDF parser with multipage support
+│   ├── frt_report_parser.py   # Detailed report page parser
+│   ├── page_classifier.py     # Page type detection (TABLE/REPORT/COVER)
+│   ├── diff_detector.py       # Change detection
+│   ├── config.py              # Configuration
 │   └── __init__.py
-├── data/                   # Data storage (gitignored)
+├── data/                      # Data storage (gitignored)
 │   ├── frt_current.pdf
 │   ├── frt_database.json
 │   ├── frt_database_previous.json
 │   ├── frt_changes.json
 │   └── frt_metadata.json
-├── logs/                   # Log files (gitignored)
+├── logs/                      # Log files (gitignored)
 │   └── frt_parser.log
+├── tests/                     # Test suite
+│   ├── test_multipage_extraction.py
+│   ├── test_report_parser.py
+│   └── validate_frn_152726.py
 ├── requirements.txt
 └── README.md
+```
+
+### Parsing Strategy
+
+The parser uses a **multi-strategy approach** to handle different page layouts:
+
+1. **Page Classification**: Each page is classified as TABLE, REPORT, or COVER
+   - TABLE pages contain multiple firearm records in columnar format
+   - REPORT pages contain detailed information for a single firearm (may span 2-3+ pages)
+   - COVER pages are skipped
+
+2. **Column-Based Extraction** (TABLE pages):
+   - Detects column boundaries from header row
+   - Assigns words to columns based on center-point detection
+   - Reconstructs rows from sequential words
+
+3. **Multipage Report Buffering** (REPORT pages):
+   - Tracks continuation pages by FRN
+   - Buffers all pages for the same FRN
+   - Stitches content from multiple pages into single record
+   - Extracts extended descriptions, product codes, calibre variants
+
+## Multipage Record Support (v2.0)
+
+The parser now **fully supports multipage firearm records**. Some firearms in the FRT have detailed specifications that span 2-3+ pages.
+
+### How It Works
+
+1. **Automatic Detection**: Pages with the same FRN are automatically grouped together
+2. **Continuation Tracking**: Each continuation page is validated to ensure it belongs to the same firearm
+3. **Content Merging**: Information from all pages is intelligently merged:
+   - Extended Make/Model/Manufacturer descriptions
+   - Product codes and aliases
+   - Calibre variants and specifications
+   - Cross-references
+
+### Example: FRN 152726
+
+This firearm spans 3 pages in the PDF:
+- **Page 1**: Basic summary (Make, Model, Type, Class)
+- **Page 2**: Detailed descriptions of Make, Model, Manufacturer, Action, Serial Number, Calibre, Shots
+- **Page 3**: Product codes (12 different aliases)
+
+The parser automatically extracts all this information and combines it into a single comprehensive record.
+
+### Testing Multipage Extraction
+
+```bash
+# Validate multipage extraction for FRN 152726
+python tests/validate_frn_152726.py
+
+# Run full test suite
+python -m pytest tests/test_multipage_extraction.py -v
 ```
 
 ## Known Limitations
@@ -252,7 +330,7 @@ backend/
 
 2. **Column Detection**: Parser assumes standard FRT table structure. Significant format changes by RCMP may require adjustments.
 
-3. **Multi-line Rows**: Complex multi-line handling works for typical cases but may need refinement for unusual table structures.
+3. **Calibre Variant Tables**: Table extraction within report pages may miss complex nested tables (depends on PDF structure).
 
 4. **OIC Extraction**: Pattern matching for OIC references works for common formats but may miss non-standard notations.
 
